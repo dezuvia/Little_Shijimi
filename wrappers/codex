@@ -1,0 +1,203 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SOURCE="${BASH_SOURCE[0]}"
+while [[ -h "$SOURCE" ]]; do
+  DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+  LINK_TARGET="$(readlink "$SOURCE")"
+  if [[ "$LINK_TARGET" == /* ]]; then
+    SOURCE="$LINK_TARGET"
+  else
+    SOURCE="$DIR/$LINK_TARGET"
+  fi
+done
+ROOT="$(cd -P "$(dirname "$SOURCE")/.." && pwd)"
+
+REAL_CODEX="${CODEX_NOTIFY_REAL_CODEX:-/opt/homebrew/bin/codex}"
+PROMPT_PROXY="${CODEX_NOTIFY_PROMPT_PROXY:-$ROOT/scripts/agent_telegram_tty_proxy.py}"
+WATCHER="${CODEX_NOTIFY_WATCHER:-$ROOT/scripts/codex_session_watch.py}"
+SEND_LAST_MESSAGE="${CODEX_NOTIFY_SEND_LAST_MESSAGE:-$ROOT/scripts/send_last_message.py}"
+PREVIEW_CHARS="${CODEX_NOTIFY_PREVIEW_CHARS:-220}"
+DEBUG_LOG="${CODEX_NOTIFY_LOG:-${TMPDIR:-/tmp}/codex-telegram-notify.log}"
+DELETE_AFTER="${CODEX_NOTIFY_DELETE_AFTER:-0}"
+STATE_DIR="${CODEX_NOTIFY_STATE_DIR:-${TMPDIR:-/tmp}/codex-telegram-notify}"
+DELETE_QUEUE_PATH="$STATE_DIR/delete_queue.jsonl"
+PROMPT_PROXY_DISABLE="${CODEX_NOTIFY_PROMPT_PROXY_DISABLE:-0}"
+ATTACH_TIMEOUT="${CODEX_NOTIFY_ATTACH_TIMEOUT:-45}"
+OWNER_EXIT_GRACE="${CODEX_NOTIFY_OWNER_EXIT_GRACE:-8}"
+
+if [[ ! -x "$REAL_CODEX" ]]; then
+  echo "Little_Shijimi error: real codex binary not found at $REAL_CODEX" >&2
+  exit 1
+fi
+
+mkdir -p "$(dirname "$DEBUG_LOG")" "$STATE_DIR" 2>/dev/null || true
+
+log_debug() {
+  local message="$1"
+  local log_dir
+  log_dir="$(dirname "$DEBUG_LOG")"
+  [[ -w "$log_dir" ]] || return 0
+  printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$message" >> "$DEBUG_LOG"
+}
+
+default_label() {
+  local tty_path
+  tty_path="$(tty 2>/dev/null || true)"
+  if [[ -n "$tty_path" && "$tty_path" != "not a tty" ]]; then
+    /usr/bin/basename "$tty_path"
+    return 0
+  fi
+  /usr/bin/basename "$PWD"
+}
+
+should_capture_last_message() {
+  local arg
+  local seen_exec=0
+  for arg in "$@"; do
+    case "$arg" in
+      exec)
+        seen_exec=1
+        ;;
+      -o|--output-last-message)
+        return 1
+        ;;
+    esac
+  done
+  (( seen_exec == 1 ))
+}
+
+build_non_tty_command() {
+  local output_file="$1"
+  shift
+  local arg
+  local inserted=0
+  NON_TTY_CAPTURE_ARGS=()
+  for arg in "$@"; do
+    NON_TTY_CAPTURE_ARGS+=("$arg")
+    if (( inserted == 0 )) && [[ "$arg" == "exec" ]]; then
+      NON_TTY_CAPTURE_ARGS+=("--output-last-message" "$output_file")
+      inserted=1
+    fi
+  done
+}
+
+send_last_message_notification() {
+  local message_file="$1"
+  local label="$2"
+  local cwd="$3"
+  [[ -s "$message_file" ]] || return 0
+  TG_BOT_TOKEN="${TG_BOT_TOKEN:-}" \
+  TG_CHAT_ID="${TG_CHAT_ID:-}" \
+  python3 "$SEND_LAST_MESSAGE" \
+    --message-file "$message_file" \
+    --cwd "$cwd" \
+    --label "$label" \
+    --log "$DEBUG_LOG" \
+    --preview-chars "$PREVIEW_CHARS" \
+    --delete-after "$DELETE_AFTER" \
+    --delete-queue-path "$DELETE_QUEUE_PATH"
+}
+
+run_non_tty_exec_with_notification() {
+  local label="$1"
+  local cwd="$2"
+  shift 2
+
+  local rc=0
+  local output_file=""
+  local -a cmd_args=()
+
+  if should_capture_last_message "$@"; then
+    output_file="$(mktemp "$STATE_DIR/codex-last-message.XXXXXX" 2>/dev/null || true)"
+    if [[ -n "$output_file" ]]; then
+      build_non_tty_command "$output_file" "$@"
+      cmd_args=("${NON_TTY_CAPTURE_ARGS[@]}")
+      log_debug "non-tty last-message capture file=$output_file"
+    else
+      cmd_args=("$@")
+      log_debug "non-tty last-message capture disabled: state dir unavailable"
+    fi
+  else
+    cmd_args=("$@")
+  fi
+
+  set +e
+  "$REAL_CODEX" "${cmd_args[@]}"
+  rc=$?
+  set -e
+
+  if [[ -n "$output_file" ]]; then
+    send_last_message_notification "$output_file" "$label" "$cwd"
+    rm -f "$output_file" 2>/dev/null || true
+  fi
+
+  return "$rc"
+}
+
+start_watcher() {
+  local label="$1"
+  local watcher_pid_var="$2"
+  local watcher_pid=""
+  if [[ -f "$WATCHER" ]]; then
+    TG_BOT_TOKEN="${TG_BOT_TOKEN:-}" \
+    TG_CHAT_ID="${TG_CHAT_ID:-}" \
+    python3 "$WATCHER" \
+      --cwd "$PWD" \
+      --label "$label" \
+      --owner-pid "$$" \
+      --log "$DEBUG_LOG" \
+      --preview-chars "$PREVIEW_CHARS" \
+      --attach-timeout "$ATTACH_TIMEOUT" \
+      --owner-exit-grace "$OWNER_EXIT_GRACE" \
+      --delete-after "$DELETE_AFTER" \
+      --delete-queue-path "$DELETE_QUEUE_PATH" &
+    watcher_pid="$!"
+  fi
+  printf -v "$watcher_pid_var" '%s' "$watcher_pid"
+}
+
+wait_for_watcher() {
+  local watcher_pid="$1"
+  [[ -n "$watcher_pid" ]] || return 0
+  wait "$watcher_pid" 2>/dev/null || true
+}
+
+if [[ -z "${TG_BOT_TOKEN:-}" || -z "${TG_CHAT_ID:-}" || "${CODEX_NOTIFY_DISABLE:-0}" == "1" ]]; then
+  exec "$REAL_CODEX" "$@"
+fi
+
+label="${CODEX_NOTIFY_LABEL:-$(default_label)}"
+log_debug "wrapper invoked label=$label cwd=$PWD"
+
+if [[ ! -t 0 || ! -t 1 ]]; then
+  run_non_tty_exec_with_notification "$label" "$PWD" "$@"
+  exit $?
+fi
+
+watcher_pid=""
+start_watcher "$label" watcher_pid
+
+if [[ "$PROMPT_PROXY_DISABLE" != "1" && -f "$PROMPT_PROXY" ]]; then
+  set +e
+  AGENT_NOTIFY_LABEL="$label" \
+  AGENT_NOTIFY_CWD="$PWD" \
+  AGENT_NOTIFY_LOG="$DEBUG_LOG" \
+  AGENT_NOTIFY_PREVIEW_CHARS="$PREVIEW_CHARS" \
+  AGENT_NOTIFY_DELETE_AFTER="$DELETE_AFTER" \
+  AGENT_NOTIFY_DELETE_QUEUE_PATH="$DELETE_QUEUE_PATH" \
+  TG_BOT_TOKEN="${TG_BOT_TOKEN:-}" \
+  TG_CHAT_ID="${TG_CHAT_ID:-}" \
+  python3 "$PROMPT_PROXY" -- "$REAL_CODEX" "$@"
+  rc=$?
+  set -e
+  wait_for_watcher "$watcher_pid"
+  exit "$rc"
+fi
+
+set +e
+"$REAL_CODEX" "$@"
+rc=$?
+set -e
+wait_for_watcher "$watcher_pid"
+exit "$rc"
