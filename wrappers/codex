@@ -17,6 +17,7 @@ REAL_CODEX="${CODEX_NOTIFY_REAL_CODEX:-/opt/homebrew/bin/codex}"
 PROMPT_PROXY="${CODEX_NOTIFY_PROMPT_PROXY:-$ROOT/scripts/agent_telegram_tty_proxy.py}"
 WATCHER="${CODEX_NOTIFY_WATCHER:-$ROOT/scripts/codex_session_watch.py}"
 SEND_LAST_MESSAGE="${CODEX_NOTIFY_SEND_LAST_MESSAGE:-$ROOT/scripts/send_last_message.py}"
+REPLY_LISTENER="${CODEX_NOTIFY_REPLY_LISTENER:-$ROOT/scripts/telegram_reply_listener.py}"
 PREVIEW_CHARS="${CODEX_NOTIFY_PREVIEW_CHARS:-220}"
 DEBUG_LOG="${CODEX_NOTIFY_LOG:-${TMPDIR:-/tmp}/codex-telegram-notify.log}"
 DELETE_AFTER="${CODEX_NOTIFY_DELETE_AFTER:-0}"
@@ -25,6 +26,8 @@ DELETE_QUEUE_PATH="$STATE_DIR/delete_queue.jsonl"
 PROMPT_PROXY_DISABLE="${CODEX_NOTIFY_PROMPT_PROXY_DISABLE:-0}"
 ATTACH_TIMEOUT="${CODEX_NOTIFY_ATTACH_TIMEOUT:-45}"
 OWNER_EXIT_GRACE="${CODEX_NOTIFY_OWNER_EXIT_GRACE:-8}"
+REPLY_IDLE_EXIT="${CODEX_NOTIFY_REPLY_IDLE_EXIT:-300}"
+REPLY_POLL_TIMEOUT="${CODEX_NOTIFY_REPLY_POLL_TIMEOUT:-20}"
 
 if [[ ! -x "$REAL_CODEX" ]]; then
   echo "Little_Shijimi error: real codex binary not found at $REAL_CODEX" >&2
@@ -49,6 +52,16 @@ default_label() {
     return 0
   fi
   /usr/bin/basename "$PWD"
+}
+
+current_terminal_key() {
+  local tty_path
+  tty_path="$(tty 2>/dev/null || true)"
+  if [[ -n "$tty_path" && "$tty_path" != "not a tty" ]]; then
+    /usr/bin/basename "$tty_path"
+    return 0
+  fi
+  default_label
 }
 
 should_capture_last_message() {
@@ -163,11 +176,23 @@ wait_for_watcher() {
   wait "$watcher_pid" 2>/dev/null || true
 }
 
+start_reply_listener() {
+  [[ -f "$REPLY_LISTENER" ]] || return 0
+  TG_BOT_TOKEN="${TG_BOT_TOKEN:-}" \
+  TG_CHAT_ID="${TG_CHAT_ID:-}" \
+  python3 "$REPLY_LISTENER" \
+    --state-dir "$STATE_DIR" \
+    --log "$DEBUG_LOG" \
+    --idle-exit "$REPLY_IDLE_EXIT" \
+    --poll-timeout "$REPLY_POLL_TIMEOUT" >/dev/null 2>&1 &
+}
+
 if [[ -z "${TG_BOT_TOKEN:-}" || -z "${TG_CHAT_ID:-}" || "${CODEX_NOTIFY_DISABLE:-0}" == "1" ]]; then
   exec "$REAL_CODEX" "$@"
 fi
 
 label="${CODEX_NOTIFY_LABEL:-$(default_label)}"
+terminal_key="$(current_terminal_key)"
 log_debug "wrapper invoked label=$label cwd=$PWD"
 
 if [[ ! -t 0 || ! -t 1 ]]; then
@@ -177,6 +202,7 @@ fi
 
 watcher_pid=""
 start_watcher "$label" watcher_pid
+start_reply_listener
 
 if [[ "$PROMPT_PROXY_DISABLE" != "1" && -f "$PROMPT_PROXY" ]]; then
   set +e
@@ -186,6 +212,8 @@ if [[ "$PROMPT_PROXY_DISABLE" != "1" && -f "$PROMPT_PROXY" ]]; then
   AGENT_NOTIFY_PREVIEW_CHARS="$PREVIEW_CHARS" \
   AGENT_NOTIFY_DELETE_AFTER="$DELETE_AFTER" \
   AGENT_NOTIFY_DELETE_QUEUE_PATH="$DELETE_QUEUE_PATH" \
+  AGENT_NOTIFY_STATE_DIR="$STATE_DIR" \
+  AGENT_NOTIFY_TERMINAL_KEY="$terminal_key" \
   TG_BOT_TOKEN="${TG_BOT_TOKEN:-}" \
   TG_CHAT_ID="${TG_CHAT_ID:-}" \
   python3 "$PROMPT_PROXY" -- "$REAL_CODEX" "$@"
